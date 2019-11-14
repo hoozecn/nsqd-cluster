@@ -1,7 +1,7 @@
 version: "3"
 services: 
   nsqadmin:
-    image: nsqio/nsq:v0.3.7-HA.1.9.7
+    image: hoozecn/nsq:v0.3.7-HA.1.9.7
     ports:
       - "24171:4171"
     command: >-
@@ -41,7 +41,7 @@ services:
       -initial-cluster "etcd1=http://nsqd-cluster_etcd1_1:2380,etcd2=http://nsqd-cluster_etcd2_1:2380,etcd3=http://nsqd-cluster_etcd3_1:2380"
       -initial-cluster-state new
   nsqlookupd:
-    image: nsqio/nsq:v0.3.7-HA.1.9.7
+    image: hoozecn/nsq:v0.3.7-HA.1.9.7
     command: >-
       sh -c "
       /nsqlookupd
@@ -53,7 +53,7 @@ services:
       -cluster-id=etcd-cluster
       -cluster-leadership-addresses=http://nsqd-cluster_etcd1_1:2379,http://nsqd-cluster_etcd2_1:2379,http://nsqd-cluster_etcd3_1:2379"
   nsqd:
-    image: nsqio/nsq:v0.3.7-HA.1.9.7
+    image: hoozecn/nsq:v0.3.7-HA.1.9.7
     command: >-
       sh -c "
       /nsqd 
