@@ -8,25 +8,29 @@ import (
 )
 
 func produce(addresses []string) {
-	cfg := nsq.NewConfig()
-	cfg.LookupdPollInterval = time.Second
-	topics := []string{"events"}
-	producer, err := nsq.NewTopicProducerMgr(topics, cfg)
-	if err != nil {
-		panic(err)
-	}
-
-	producer.AddLookupdNodes(addresses)
-
 	for {
-		now := time.Now().Format(time.RFC3339)
-		log.Printf("publish: %s", now)
-		err = producer.Publish("events", []byte(now))
+		cfg := nsq.NewConfig()
+		cfg.LookupdPollInterval = time.Second
+		topics := []string{"events"}
+		producer, err := nsq.NewTopicProducerMgr(topics, cfg)
 		if err != nil {
-			log.Println(err)
-			return
+			panic(err)
 		}
-		time.Sleep(time.Second)
+
+		producer.AddLookupdNodes(addresses)
+
+		for {
+			now := time.Now().Format(time.RFC3339)
+			log.Printf("publish: %s", now)
+			err = producer.Publish("events", []byte(now))
+			if err != nil {
+				log.Println(err)
+				producer.Stop()
+				time.Sleep(5 * time.Second)
+				break
+			}
+			time.Sleep(time.Second)
+		}
 	}
 }
 
