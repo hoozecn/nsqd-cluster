@@ -1,0 +1,23 @@
+version: "3"
+services: 
+  nsqadmin:
+    image: nsqio/nsq
+    ports:
+      - "24171:4171"
+    command: >-
+      sh -c "/nsqadmin
+      -lookupd-http-address=nsqd-cluster_nsqlookupd_1:4161
+      -lookupd-http-address=nsqd-cluster_nsqlookupd_2:4161
+      -lookupd-http-address=nsqd-cluster_nsqlookupd_3:4161"
+  nsqlookupd:
+    image: nsqio/nsq
+    command: /nsqlookupd
+  nsqd:
+    image: nsqio/nsq
+    command: >-
+      sh -c "
+      /nsqd 
+      -lookupd-tcp-address=nsqd-cluster_nsqlookupd_1:4160
+      -lookupd-tcp-address=nsqd-cluster_nsqlookupd_2:4160
+      -lookupd-tcp-address=nsqd-cluster_nsqlookupd_3:4160
+      -broadcast-address=$$(hostname -i)"
