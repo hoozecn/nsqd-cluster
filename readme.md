@@ -2,7 +2,7 @@
 
 1. start nsq cluster
 
-`sh start_nsq.sh`
+`sh start_services.sh`
 
 2. start producer
 
