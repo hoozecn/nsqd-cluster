@@ -43,7 +43,8 @@ services:
     image: nsqio/nsq:v0.3.7-HA.1.9.7
     command: >-
       /nsqlookupd
-      -verbose
+      -logtostderr
+      -log-level=5
       -cluster-id=nsq-cluster
       -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
   nsqd:
@@ -54,7 +55,8 @@ services:
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_1:4160
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_2:4160
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_3:4160
-      -verbose
+      -logtostderr
+      -log-level=5
       -cluster-id=nsq-cluster
       -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
       -broadcast-address=$$(hostname -i)"
