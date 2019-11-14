@@ -6,6 +6,7 @@ services:
       - "24171:4171"
     command: >-
       sh -c "/nsqadmin
+      -logtostderr
       -lookupd-http-address=nsqd-cluster_nsqlookupd_1:4161
       -lookupd-http-address=nsqd-cluster_nsqlookupd_2:4161
       -lookupd-http-address=nsqd-cluster_nsqlookupd_3:4161"
@@ -42,11 +43,15 @@ services:
   nsqlookupd:
     image: nsqio/nsq:v0.3.7-HA.1.9.7
     command: >-
+      sh -c "
       /nsqlookupd
       -logtostderr
       -log-level=5
-      -cluster-id=nsq-cluster
-      -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
+      -rpc-port=3000
+      -tcp-address=$$(hostname -i):4160
+      -broadcast-address=$$(hostname -i)
+      -cluster-id=etcd-cluster
+      -cluster-leadership-addresses=http://nsqd-cluster_etcd1_1:2379,http://nsqd-cluster_etcd2_1:2379,http://nsqd-cluster_etcd3_1:2379"
   nsqd:
     image: nsqio/nsq:v0.3.7-HA.1.9.7
     command: >-
@@ -57,6 +62,7 @@ services:
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_3:4160
       -logtostderr
       -log-level=5
-      -cluster-id=nsq-cluster
-      -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
+      -rpc-port=3000
+      -cluster-id=etcd-cluster
+      -cluster-leadership-addresses=http://nsqd-cluster_etcd1_1:2379,http://nsqd-cluster_etcd2_1:2379,http://nsqd-cluster_etcd3_1:2379
       -broadcast-address=$$(hostname -i)"

@@ -16,10 +16,11 @@ func produce(addr string) {
 
 	for {
 		now := time.Now().Format(time.RFC3339)
-		log.Printf("publish: %s", now)
-		err = producer.Publish("events", []byte(now))
+		log.Printf("%s publish: %s", addr, now)
+		err = producer.Publish("messages", []byte(now))
 		if err != nil {
-			panic(err)
+			log.Println(err)
+			return
 		}
 		time.Sleep(time.Second)
 	}
@@ -31,5 +32,7 @@ func main() {
 
 	// produce message via nsqd_2
 	go produce("nsqd-cluster_nsqd_2:4150")
+
+	go produce("nsqd-cluster_nsqd_3:4150")
 	select {}
 }
