@@ -17,7 +17,7 @@ func (h *handler) HandleMessage(message *nsq.Message) error {
 
 func consume(addrs []string, name string) {
 	cfg := nsq.NewConfig()
-	consumer, err := nsq.NewConsumer("messages", name+"#ephemeral", cfg)
+	consumer, err := nsq.NewConsumer("events", name+"#ephemeral", cfg)
 	if err != nil {
 		panic(err)
 	}

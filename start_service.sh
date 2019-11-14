@@ -1,8 +1,14 @@
 #!/bin/sh
 set -e
 
+# start etcd
 docker-compose up -d etcd1 etcd2 etcd3
-docker run --network nsqd-cluster_default buildpack-deps:curl sh -c 'curl -X POST "http://nsqd-cluster_etcd1_1:2379/v2/keys/NSQMetaData/etcd-cluster/Topics"'
+# start nslookupd
 docker-compose scale nsqlookupd=3
+# start nsqd
 docker-compose scale nsqd=3
+# start nsqadmin
 docker-compose scale nsqadmin=1
+
+# create topic events
+curl 'http://127.0.0.1:24171/api/topics' -H content-type:'application/json' --data-binary '{"topic":"events","partition_num":"1","replicator":"3","retention_days":"","syncdisk":"","orderedmulti":"false","extend":"false"}'
