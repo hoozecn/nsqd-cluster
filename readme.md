@@ -1,5 +1,7 @@
 ## 有赞NSQ集群评估 （需要安装 docker和docker-compose）
 
+3个ectd节点，3个nsqlookupd，3个nsqd，1个consumer，1个producer
+
 1. start nsq cluster
 
 `sh start_services.sh`
