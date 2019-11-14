@@ -2,17 +2,41 @@ package nsq
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"sync/atomic"
 	"time"
+	"strconv"
 )
 
 // The number of bytes for a Message.ID
 const MsgIDLength = 16
 
-// MessageID is the ASCII encoded hexadecimal message ID
+type FullMessageID [MsgIDLength]byte
+
+// MessageID is the binary bytes message ID
 type MessageID [MsgIDLength]byte
+
+type NewMessageID uint64
+
+func GetCompatibleMsgIDFromNew(id NewMessageID, traceID uint64) MessageID {
+	var buf MessageID
+	binary.BigEndian.PutUint64(buf[:8], uint64(id))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(traceID))
+	return buf
+}
+
+func GetNewMessageID(old []byte) NewMessageID {
+	return NewMessageID(binary.BigEndian.Uint64(old[:8]))
+}
+
+//ext versions
+// version for message has no ext
+var NoExtVer = uint8(0)
+
+// version for message has json header ext
+var JSONHeaderExtVer = uint8(4)
 
 // Message is the fundamental data type containing
 // the id, body, and metadata
@@ -23,11 +47,16 @@ type Message struct {
 	Attempts  uint16
 
 	NSQDAddress string
-
+	Partition string
 	Delegate MessageDelegate
 
 	autoResponseDisabled int32
 	responded            int32
+	Offset               uint64
+	RawSize              uint32
+
+	ExtVer   uint8
+	ExtBytes []byte
 }
 
 // NewMessage creates a Message, initializes some metadata,
@@ -38,6 +67,43 @@ func NewMessage(id MessageID, body []byte) *Message {
 		Body:      body,
 		Timestamp: time.Now().UnixNano(),
 	}
+}
+
+func (m *Message) GetTraceID() uint64 {
+	if len(m.ID) < 16 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(m.ID[8:16])
+}
+
+func (m *Message) GetFullMsgID() FullMessageID {
+	return FullMessageID(m.ID)
+}
+
+func (m *Message) GetJsonExt() (*MsgExt, error) {
+	if m.ExtVer != JSONHeaderExtVer {
+		return nil, errors.New("the header is not json extention")
+	}
+	var jext MsgExt
+	if len(m.ExtBytes) > 0 {
+		err := json.Unmarshal(m.ExtBytes, &jext.Custom)
+		if err != nil {
+			return nil, err
+		}
+	}
+	//fetch tag
+	if tag, exist := jext.Custom[dispatchTagExtK]; exist {
+		jext.DispatchTag = tag
+	}
+	//fetch traceID
+	if traceIDStr, exist := jext.Custom[traceIDExtK]; exist {
+		var err error
+		jext.TraceID, err = strconv.ParseUint(traceIDStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &jext, nil
 }
 
 // DisableAutoResponse disables the automatic response that
@@ -138,27 +204,55 @@ func (m *Message) WriteTo(w io.Writer) (int64, error) {
 	return total, nil
 }
 
-// DecodeMessage deserializes data (as []byte) and creates a new Message
-// message format:
-//  [x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x][x]...
-//  |       (int64)        ||    ||      (hex string encoded in ASCII)           || (binary)
-//  |       8-byte         ||    ||                 16-byte                      || N-byte
-//  ------------------------------------------------------------------------------------------...
-//    nanosecond timestamp    ^^                   message ID                       message body
-//                         (uint16)
-//                          2-byte
-//                         attempts
+// DecodeMessage deseralizes data (as []byte) and creates a new Message
 func DecodeMessage(b []byte) (*Message, error) {
-	var msg Message
-
 	if len(b) < 10+MsgIDLength {
 		return nil, errors.New("not enough data to decode valid message")
 	}
-
+	var msg Message
 	msg.Timestamp = int64(binary.BigEndian.Uint64(b[:8]))
 	msg.Attempts = binary.BigEndian.Uint16(b[8:10])
+
 	copy(msg.ID[:], b[10:10+MsgIDLength])
 	msg.Body = b[10+MsgIDLength:]
+	return &msg, nil
+}
 
+// DecodeMessage deseralizes data (as []byte) and creates a new Message
+func DecodeMessageWithExt(b []byte, ext bool) (*Message, error) {
+	if len(b) < 10+MsgIDLength {
+		return nil, errors.New("not enough data to decode valid message")
+	}
+	var msg Message
+	pos := 0
+	msg.Timestamp = int64(binary.BigEndian.Uint64(b[:8]))
+	pos += 8
+	msg.Attempts = binary.BigEndian.Uint16(b[pos : pos+2])
+	pos += 2
+
+	copy(msg.ID[:], b[pos:pos+MsgIDLength])
+	pos += MsgIDLength
+	if ext {
+		if len(b) < pos+1 {
+			return nil, errors.New("not enough data to decode valid message")
+		}
+		msg.ExtVer = uint8(b[pos])
+		pos++
+		switch msg.ExtVer {
+		case 0x0:
+		default:
+			if len(b) < pos+2 {
+				return nil, errors.New("not enough data to decode valid message")
+			}
+			extLen := binary.BigEndian.Uint16(b[pos : pos+2])
+			pos += 2
+			if len(b) < pos+int(extLen) {
+				return nil, errors.New("not enough data to decode valid message")
+			}
+			msg.ExtBytes = b[pos : pos+int(extLen)]
+			pos += int(extLen)
+		}
+	}
+	msg.Body = b[pos:]
 	return &msg, nil
 }

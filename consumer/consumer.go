@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/nsqio/go-nsq"
+	"github.com/youzan/go-nsq"
 )
 
 type handler struct {

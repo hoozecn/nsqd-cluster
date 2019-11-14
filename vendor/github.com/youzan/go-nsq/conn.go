@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,16 +54,17 @@ type Conn struct {
 	maxRdyCount      int64
 	rdyCount         int64
 	lastRdyCount     int64
-	lastRdyTimestamp int64
 	lastMsgTimestamp int64
 
 	mtx sync.Mutex
 
 	config *Config
 
-	conn    *net.TCPConn
-	tlsConn *tls.Conn
-	addr    string
+	conn        *net.TCPConn
+	tlsConn     *tls.Conn
+	addr        string
+	consumePart string
+	ext         bool
 
 	delegate ConnDelegate
 
@@ -214,19 +216,12 @@ func (c *Conn) LastRDY() int64 {
 func (c *Conn) SetRDY(rdy int64) {
 	atomic.StoreInt64(&c.rdyCount, rdy)
 	atomic.StoreInt64(&c.lastRdyCount, rdy)
-	if rdy > 0 {
-		atomic.StoreInt64(&c.lastRdyTimestamp, time.Now().UnixNano())
-	}
 }
 
 // MaxRDY returns the nsqd negotiated maximum
 // RDY count that it will accept for this connection
 func (c *Conn) MaxRDY() int64 {
 	return c.maxRdyCount
-}
-
-func (c *Conn) LastRdyTime() time.Time {
-	return time.Unix(0, atomic.LoadInt64(&c.lastRdyTimestamp))
 }
 
 // LastMessageTime returns a time.Time representing
@@ -245,15 +240,27 @@ func (c *Conn) String() string {
 	return c.addr
 }
 
+func (c *Conn) GetConnUID() string {
+	if c.consumePart == "" {
+		return c.addr
+	}
+	pstr, _ := strconv.Atoi(c.consumePart)
+	return getConnectionUID(c.addr, pstr)
+}
+
 // Read performs a deadlined read on the underlying TCP connection
 func (c *Conn) Read(p []byte) (int, error) {
-	c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+	if c.config.ReadTimeout > 0 {
+		c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+	}
 	return c.r.Read(p)
 }
 
 // Write performs a deadlined write on the underlying TCP connection
 func (c *Conn) Write(p []byte) (int, error) {
-	c.conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
+	if c.config.WriteTimeout > 0 {
+		c.conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
+	}
 	return c.w.Write(p)
 }
 
@@ -300,6 +307,7 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 	ci["deflate"] = c.config.Deflate
 	ci["deflate_level"] = c.config.DeflateLevel
 	ci["snappy"] = c.config.Snappy
+	ci["multiplexing"] = c.config.EnableMultiplexing
 	ci["feature_negotiation"] = true
 	if c.config.HeartbeatInterval == -1 {
 		ci["heartbeat_interval"] = -1
@@ -314,6 +322,11 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 		ci["output_buffer_timeout"] = int64(c.config.OutputBufferTimeout / time.Millisecond)
 	}
 	ci["msg_timeout"] = int64(c.config.MsgTimeout / time.Millisecond)
+	ci["desired_tag"] = c.config.DesiredTag
+	if c.ext {
+		ci["extend_support"] = true
+	}
+
 	cmd, err := Identify(ci)
 	if err != nil {
 		return nil, ErrIdentify{err.Error()}
@@ -488,9 +501,6 @@ func (c *Conn) readLoop() {
 
 		frameType, data, err := ReadUnpackedResponse(c)
 		if err != nil {
-			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
-				goto exit
-			}
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
@@ -514,7 +524,7 @@ func (c *Conn) readLoop() {
 		case FrameTypeResponse:
 			c.delegate.OnResponse(c, data)
 		case FrameTypeMessage:
-			msg, err := DecodeMessage(data)
+			msg, err := DecodeMessageWithExt(data, c.ext)
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
@@ -522,7 +532,7 @@ func (c *Conn) readLoop() {
 			}
 			msg.Delegate = delegate
 			msg.NSQDAddress = c.String()
-
+			msg.Partition = c.consumePart
 			atomic.AddInt64(&c.rdyCount, -1)
 			atomic.AddInt64(&c.messagesInFlight, 1)
 			atomic.StoreInt64(&c.lastMsgTimestamp, time.Now().UnixNano())

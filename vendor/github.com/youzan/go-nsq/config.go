@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"hash"
 	"io/ioutil"
 	"log"
 	"math"
@@ -92,11 +93,12 @@ type Config struct {
 	// used to Initialize, Validate
 	configHandlers []configHandler
 
-	DialTimeout time.Duration `opt:"dial_timeout" default:"1s"`
+	DialTimeout time.Duration `opt:"dial_timeout" default:"5s"`
 
 	// Deadlines for network reads and writes
-	ReadTimeout  time.Duration `opt:"read_timeout" min:"100ms" max:"5m" default:"60s"`
-	WriteTimeout time.Duration `opt:"write_timeout" min:"100ms" max:"5m" default:"1s"`
+	ReadTimeout  time.Duration `opt:"read_timeout" max:"5m" default:"60s"`
+	WriteTimeout time.Duration `opt:"write_timeout" max:"5m" default:"1s"`
+	PubTimeout   time.Duration `opt:"pub_timeout" max:"1m" default:"10s"`
 
 	// LocalAddr is the local address to use when dialing an nsqd.
 	// If empty, a local address is automatically chosen.
@@ -108,11 +110,11 @@ type Config struct {
 	//
 	// NOTE: when not using nsqlookupd, LookupdPollInterval represents the duration of time between
 	// reconnection attempts
-	LookupdPollInterval time.Duration `opt:"lookupd_poll_interval" min:"10ms" max:"5m" default:"60s"`
+	LookupdPollInterval time.Duration `opt:"lookupd_poll_interval" min:"1s" max:"5m" default:"60s"`
 	LookupdPollJitter   float64       `opt:"lookupd_poll_jitter" min:"0" max:"1" default:"0.3"`
 
 	// Maximum duration when REQueueing (for doubling of deferred requeue)
-	MaxRequeueDelay     time.Duration `opt:"max_requeue_delay" min:"0" max:"60m" default:"15m"`
+	MaxRequeueDelay     time.Duration `opt:"max_requeue_delay" min:"0" max:"600m" default:"15m"`
 	DefaultRequeueDelay time.Duration `opt:"default_requeue_delay" min:"0" max:"60m" default:"90s"`
 
 	// Backoff strategy, defaults to exponential backoff. Overwrite this to define alternative backoff algrithms.
@@ -123,13 +125,12 @@ type Config struct {
 	BackoffMultiplier time.Duration `opt:"backoff_multiplier" min:"0" max:"60m" default:"1s"`
 
 	// Maximum number of times this consumer will attempt to process a message before giving up
-	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"5"`
+	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"15"`
 
-	// Duration to wait for a message from an nsqd when in a state where RDY
-	// counts are re-distributed (e.g. max_in_flight < num_producers)
+	// Duration to wait for a message from a producer when in a state where RDY
+	// counts are re-distributed (ie. max_in_flight < num_producers)
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`
-	// Duration to wait until redistributing RDY for an nsqd regardless of LowRdyIdleTimeout
-	LowRdyTimeout time.Duration `opt:"low_rdy_timeout" min:"1s" max:"5m" default:"30s"`
+
 	// Duration between redistributing max-in-flight to connections
 	RDYRedistributeInterval time.Duration `opt:"rdy_redistribute_interval" min:"1ms" max:"5s" default:"5s"`
 
@@ -171,13 +172,29 @@ type Config struct {
 	OutputBufferTimeout time.Duration `opt:"output_buffer_timeout" default:"250ms"`
 
 	// Maximum number of messages to allow in flight (concurrency knob)
-	MaxInFlight int `opt:"max_in_flight" min:"0" default:"1"`
+	MaxInFlight int `opt:"max_in_flight" min:"0" default:"20"`
 
 	// The server-side message timeout for messages delivered to this client
 	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"`
 
 	// secret for nsqd authentication (requires nsqd 0.2.29+)
 	AuthSecret string `opt:"auth_secret"`
+
+	EnableTrace   bool `opt:"enable_trace"`
+	EnableOrdered bool `opt:"enable_ordered"`
+	Hasher        hash.Hash32
+	PubStrategy   PubStrategyType
+	// pub will retry max retry times and each retry will wait pub timeout
+	PubMaxRetry           int `opt:"pub_max_retry" min:"1" max:"15" default:"3"`
+	PubMaxBackgroundRetry int `opt:"pub_max_background_retry" min:"1" max:"100" default:"15"`
+	PubBackgroundBuffer   int `opt:"pub_background_buffer" min:"10" max:"10000" default:"1000"`
+	ProducerPoolSize      int `opt:"producer_pool_size" min:"1" max:"100" default:"2"`
+	EnableMultiplexing    bool
+	DesiredTag            string `opt:"desired_tag"`
+	// seeds lookupd should be domain format (nsq.xxx.xxx:4160)
+	// and will not be removed if conection refused
+	// So it will always retry if not connected
+	LookupdSeeds []string `opt:"lookupd_seeds"`
 }
 
 // NewConfig returns a new default nsq configuration.
@@ -340,7 +357,7 @@ func (h *structTagsConfig) SetDefaults(c *Config) error {
 		log.Fatalf("ERROR: unable to get hostname %s", err.Error())
 	}
 
-	c.ClientID = strings.Split(hostname, ".")[0]
+	c.ClientID = strconv.Itoa(os.Getpid())
 	c.Hostname = hostname
 	c.UserAgent = fmt.Sprintf("go-nsq/%s", VERSION)
 	return nil
@@ -377,7 +394,7 @@ func (h *structTagsConfig) Validate(c *Config) error {
 		}
 	}
 
-	if c.HeartbeatInterval > c.ReadTimeout {
+	if c.ReadTimeout > 0 && c.HeartbeatInterval > c.ReadTimeout {
 		return fmt.Errorf("HeartbeatInterval %v must be less than ReadTimeout %v", c.HeartbeatInterval, c.ReadTimeout)
 	}
 

@@ -1,7 +1,7 @@
 version: "3"
 services: 
   nsqadmin:
-    image: nsqio/nsq
+    image: nsqio/nsq:v0.3.7-HA.1.9.7
     ports:
       - "24171:4171"
     command: >-
@@ -9,15 +9,52 @@ services:
       -lookupd-http-address=nsqd-cluster_nsqlookupd_1:4161
       -lookupd-http-address=nsqd-cluster_nsqlookupd_2:4161
       -lookupd-http-address=nsqd-cluster_nsqlookupd_3:4161"
+  etcd1:
+    image: quay-mirror.qiniu.com/coreos/etcd
+    command: >-
+      etcd -name etcd1
+      -advertise-client-urls http://0.0.0.0:2379
+      -listen-client-urls http://0.0.0.0:2379
+      -listen-peer-urls http://0.0.0.0:2380
+      -initial-cluster-token etcd-cluster
+      -initial-cluster "etcd1=http://nsqd-cluster_etcd1_1:2380,etcd2=http://nsqd-cluster_etcd2_1:2380,etcd3=http://nsqd-cluster_etcd3_1:2380"
+      -initial-cluster-state new
+  etcd2:
+    image: quay-mirror.qiniu.com/coreos/etcd
+    command: >-
+      etcd -name etcd2
+      -advertise-client-urls http://0.0.0.0:2379
+      -listen-client-urls http://0.0.0.0:2379
+      -listen-peer-urls http://0.0.0.0:2380
+      -initial-cluster-token etcd-cluster
+      -initial-cluster "etcd1=http://nsqd-cluster_etcd1_1:2380,etcd2=http://nsqd-cluster_etcd2_1:2380,etcd3=http://nsqd-cluster_etcd3_1:2380"
+      -initial-cluster-state new
+  etcd3:
+    image: quay-mirror.qiniu.com/coreos/etcd
+    command: >-
+      etcd -name etcd3
+      -advertise-client-urls http://0.0.0.0:2379
+      -listen-client-urls http://0.0.0.0:2379
+      -listen-peer-urls http://0.0.0.0:2380
+      -initial-cluster-token etcd-cluster
+      -initial-cluster "etcd1=http://nsqd-cluster_etcd1_1:2380,etcd2=http://nsqd-cluster_etcd2_1:2380,etcd3=http://nsqd-cluster_etcd3_1:2380"
+      -initial-cluster-state new
   nsqlookupd:
-    image: nsqio/nsq
-    command: /nsqlookupd
+    image: nsqio/nsq:v0.3.7-HA.1.9.7
+    command: >-
+      /nsqlookupd
+      -verbose
+      -cluster-id=nsq-cluster
+      -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
   nsqd:
-    image: nsqio/nsq
+    image: nsqio/nsq:v0.3.7-HA.1.9.7
     command: >-
       sh -c "
       /nsqd 
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_1:4160
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_2:4160
       -lookupd-tcp-address=nsqd-cluster_nsqlookupd_3:4160
+      -verbose
+      -cluster-id=nsq-cluster
+      -cluster-leadership-addresses=nsqd-cluster_etcd1_1:2379,nsqd-cluster_etcd2_1:2379,nsqd-cluster_etcd3_1:2379
       -broadcast-address=$$(hostname -i)"

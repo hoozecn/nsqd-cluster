@@ -2,6 +2,7 @@ package nsq
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -15,6 +16,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	// for old nsqd it may return the special pid for compatible
+	OLD_VERSION_PID = -11
 )
 
 // Handler is the message processing interface for Consumer
@@ -36,6 +42,7 @@ type Handler interface {
 // 		// handle the message
 // 	}))
 type HandlerFunc func(message *Message) error
+type FailHandlerFunc func(message *Message)
 
 // HandleMessage implements the Handler interface
 func (h HandlerFunc) HandleMessage(m *Message) error {
@@ -93,6 +100,8 @@ type Consumer struct {
 	backoffCounter   int32
 	maxInFlight      int32
 
+	consume_ext int32
+
 	mtx sync.RWMutex
 
 	logger   logger
@@ -101,10 +110,11 @@ type Consumer struct {
 
 	behaviorDelegate interface{}
 
-	id      int64
-	topic   string
-	channel string
-	config  Config
+	id        int64
+	topic     string
+	partition int
+	channel   string
+	config    Config
 
 	rngMtx sync.Mutex
 	rng    *rand.Rand
@@ -121,7 +131,7 @@ type Consumer struct {
 	pendingConnections map[string]*Conn
 	connections        map[string]*Conn
 
-	nsqdTCPAddrs []string
+	nsqdTCPAddrs []AddrPartInfo
 
 	// used at connection close to force a possible reconnect
 	lookupdRecheckChan chan int
@@ -138,6 +148,9 @@ type Consumer struct {
 	// read from this channel to block until consumer is cleanly stopped
 	StopChan chan int
 	exitChan chan int
+	// the offset will be set only once at the first sub to nsqd
+	offsetMutex   sync.Mutex
+	consumeOffset map[int]ConsumeOffset
 }
 
 // NewConsumer creates a new instance of Consumer for the specified topic/channel
@@ -145,6 +158,10 @@ type Consumer struct {
 // The only valid way to create a Config is via NewConfig, using a struct literal will panic.
 // After Config is passed into NewConsumer the values are no longer mutable (they are copied).
 func NewConsumer(topic string, channel string, config *Config) (*Consumer, error) {
+	return NewPartitionConsumer(topic, -1, channel, config)
+}
+
+func NewPartitionConsumer(topic string, part int, channel string, config *Config) (*Consumer, error) {
 	config.assertInitialized()
 
 	if err := config.Validate(); err != nil {
@@ -162,9 +179,10 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 	r := &Consumer{
 		id: atomic.AddInt64(&instCount, 1),
 
-		topic:   topic,
-		channel: channel,
-		config:  *config,
+		topic:     topic,
+		partition: part,
+		channel:   channel,
+		config:    *config,
 
 		logger:      log.New(os.Stderr, "", log.Flags()),
 		logLvl:      LogLevelInfo,
@@ -180,12 +198,35 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 
-		StopChan: make(chan int),
-		exitChan: make(chan int),
+		StopChan:      make(chan int),
+		exitChan:      make(chan int),
+		consumeOffset: make(map[int]ConsumeOffset),
 	}
 	r.wg.Add(1)
 	go r.rdyLoop()
 	return r, nil
+}
+
+func (r *Consumer) SetConsumeExt(topicExt bool) bool {
+	if topicExt == true {
+		return atomic.CompareAndSwapInt32(&r.consume_ext, 0, 1)
+	} else {
+		return atomic.CompareAndSwapInt32(&r.consume_ext, 1, 0)
+	}
+}
+
+func (r *Consumer) IsConsumeExt() bool {
+	return atomic.LoadInt32(&r.consume_ext) == int32(1)
+}
+
+func (r *Consumer) SetConsumeOffset(partition int, offset ConsumeOffset) error {
+	if !r.config.EnableTrace {
+		return errors.New("trace must be enabled to allow set consume offset")
+	}
+	r.offsetMutex.Lock()
+	r.consumeOffset[partition] = offset
+	r.offsetMutex.Unlock()
+	return nil
 }
 
 // Stats retrieves the current connection and message statistics for a Consumer
@@ -295,6 +336,16 @@ func (r *Consumer) ChangeMaxInFlight(maxInFlight int) {
 	}
 }
 
+func (r *Consumer) ConnectToSeeds() error {
+	for _, lookup := range r.config.LookupdSeeds {
+		err := r.ConnectToNSQLookupd(lookup)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ConnectToNSQLookupd adds an nsqlookupd address to the list for this Consumer instance.
 //
 // If it is the first to be added, it initiates an HTTP request to discover nsqd
@@ -326,6 +377,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	numLookupd := len(r.lookupdHTTPAddrs)
 	r.mtx.Unlock()
 
+	r.log(LogLevelInfo, "new lookupd address added: %s", addr)
 	// if this is the first one, kick off the go loop
 	if numLookupd == 1 {
 		r.queryLookupd()
@@ -334,6 +386,10 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	}
 
 	return nil
+}
+
+func (r *Consumer) AddEtcdServiceAddr(address []string, cluster string, key string) {
+	// TODO: get the lookup address from etcd service.
 }
 
 // ConnectToNSQLookupds adds multiple nsqlookupd address to the list for this Consumer instance.
@@ -405,7 +461,7 @@ exit:
 
 // return the next lookupd endpoint to query
 // keeping track of which one was last used
-func (r *Consumer) nextLookupdEndpoint() string {
+func (r *Consumer) nextLookupdEndpoint() (string, string, string) {
 	r.mtx.RLock()
 	if r.lookupdQueryIndex >= len(r.lookupdHTTPAddrs) {
 		r.lookupdQueryIndex = 0
@@ -424,20 +480,48 @@ func (r *Consumer) nextLookupdEndpoint() string {
 	if err != nil {
 		panic(err)
 	}
+	listUrl := *u
 	if u.Path == "/" || u.Path == "" {
 		u.Path = "/lookup"
 	}
+	listUrl.Path = "/listlookup"
 
 	v, err := url.ParseQuery(u.RawQuery)
 	v.Add("topic", r.topic)
+	v.Add("metainfo", "true")
+	v.Add("access", "r")
+	if r.partition >= 0 {
+		v.Add("partition", strconv.Itoa(r.partition))
+	}
 	u.RawQuery = v.Encode()
-	return u.String()
+	return addr, u.String(), listUrl.String()
+}
+
+type metaInfo struct {
+	PartitionNum  int  `json:"partition_num"`
+	Replica       int  `json:"replica"`
+	ExtendSupport bool `json:"extend_support"`
 }
 
 type lookupResp struct {
-	Channels  []string    `json:"channels"`
-	Producers []*peerInfo `json:"producers"`
-	Timestamp int64       `json:"timestamp"`
+	Channels   []string             `json:"channels"`
+	Producers  []*peerInfo          `json:"producers"`
+	Partitions map[string]*peerInfo `json:"partitions"`
+	Meta       metaInfo             `json:"meta"`
+}
+
+type NsqLookupdNodeInfo struct {
+	ID       string
+	NodeIp   string
+	TcpPort  string
+	HttpPort string
+	RpcPort  string
+	Epoch    int64
+}
+
+type lookupListResp struct {
+	LookupdNodes  []NsqLookupdNodeInfo `json:"lookupdnodes"`
+	LookupdLeader NsqLookupdNodeInfo   `json:"lookupdleader"`
 }
 
 type peerInfo struct {
@@ -449,46 +533,119 @@ type peerInfo struct {
 	Version          string `json:"version"`
 }
 
+func getConnectionUID(addr string, pid int) string {
+	return addr + "-" + strconv.Itoa(pid)
+}
+
 // make an HTTP req to one of the configured nsqlookupd instances to discover
 // which nsqd's provide the topic we are consuming.
 //
 // initiate a connection to any new producers that are identified.
 func (r *Consumer) queryLookupd() {
-	retries := 0
+	addr, endpoint, discoveryUrl := r.nextLookupdEndpoint()
+	// discovery other lookupd nodes from current lookupd or from etcd
+	r.log(LogLevelDebug, "discovery nsqlookupd %s", discoveryUrl)
+	var lookupdList lookupListResp
+	err := apiRequestNegotiateV1("GET", discoveryUrl, nil, &lookupdList)
+	if err != nil {
+		r.log(LogLevelError, "error discovery nsqlookupd (%s) - %s", discoveryUrl, err)
+		if strings.Contains(strings.ToLower(err.Error()), "connection refused") &&
+			FindString(r.config.LookupdSeeds, addr) == -1 {
+			r.mtx.Lock()
+			// remove failed
+			r.log(LogLevelInfo, "removing failed lookup : %v", addr)
+			newLookupList := make([]string, 0)
+			for _, v := range r.lookupdHTTPAddrs {
+				if v == addr {
+					continue
+				} else {
+					newLookupList = append(newLookupList, v)
+				}
+			}
+			if len(newLookupList) > 0 {
+				r.lookupdHTTPAddrs = newLookupList
+			}
+			r.mtx.Unlock()
+			select {
+			case r.lookupdRecheckChan <- 1:
+				r.log(LogLevelInfo, "trigger tend for err: %v", err)
+			default:
+			}
+			return
+		}
+	} else {
+		for _, node := range lookupdList.LookupdNodes {
+			addr := net.JoinHostPort(node.NodeIp, node.HttpPort)
+			r.ConnectToNSQLookupd(addr)
+		}
+	}
 
-retry:
-	endpoint := r.nextLookupdEndpoint()
-
-	r.log(LogLevelInfo, "querying nsqlookupd %s", endpoint)
-
+	r.log(LogLevelDebug, "querying nsqlookupd %s", endpoint)
 	var data lookupResp
-	err := apiRequestNegotiateV1("GET", endpoint, nil, &data)
+	err = apiRequestNegotiateV1("GET", endpoint, nil, &data)
 	if err != nil {
 		r.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
-		retries++
-		if retries < 3 {
-			r.log(LogLevelInfo, "retrying with next nsqlookupd")
-			goto retry
-		}
 		return
+	}
+	if data.Meta.ExtendSupport && !r.IsConsumeExt() {
+		r.SetConsumeExt(true)
 	}
 
 	var nsqdAddrs []string
-	for _, producer := range data.Producers {
-		broadcastAddress := producer.BroadcastAddress
-		port := producer.TCPPort
-		joined := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
-		nsqdAddrs = append(nsqdAddrs, joined)
+	partInfo := make(map[string]map[int]struct{})
+	r.log(LogLevelDebug, "producer partitions: %v", len(data.Partitions))
+
+	for pidStr, partProducer := range data.Partitions {
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			r.log(LogLevelError, "node partition string invalid: %v, %v", pidStr, err)
+			continue
+		}
+		broadcastAddress := partProducer.BroadcastAddress
+		port := partProducer.TCPPort
+		nsqdAddr := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
+		nsqdAddrs = append(nsqdAddrs, nsqdAddr)
+		nodeParts, ok := partInfo[nsqdAddr]
+		if !ok {
+			nodeParts = make(map[int]struct{})
+			partInfo[nsqdAddr] = nodeParts
+		}
+		nodeParts[pid] = struct{}{}
+		r.log(LogLevelDebug, "producer found %s , partition: %v", nsqdAddr, pid)
+	}
+
+	if len(data.Partitions) == 0 {
+		// for old lookup, no partition info for node.
+		// we always treat partition as -1
+		for _, producer := range data.Producers {
+			broadcastAddress := producer.BroadcastAddress
+			port := producer.TCPPort
+			joined := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
+			nsqdAddrs = append(nsqdAddrs, joined)
+			r.log(LogLevelDebug, "producer found %s without partition", joined)
+		}
 	}
 	// apply filter
 	if discoveryFilter, ok := r.behaviorDelegate.(DiscoveryFilter); ok {
 		nsqdAddrs = discoveryFilter.Filter(nsqdAddrs)
 	}
 	for _, addr := range nsqdAddrs {
-		err = r.ConnectToNSQD(addr)
-		if err != nil && err != ErrAlreadyConnected {
-			r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
-			continue
+		pidList, ok := partInfo[addr]
+		if !ok {
+			pid := -1
+			err = r.ConnectToNSQD(addr, pid)
+			if err != nil && err != ErrAlreadyConnected {
+				r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
+				continue
+			}
+		} else {
+			for pid, _ := range pidList {
+				err = r.ConnectToNSQD(addr, pid)
+				if err != nil && err != ErrAlreadyConnected {
+					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
+					continue
+				}
+			}
 		}
 	}
 }
@@ -497,9 +654,9 @@ retry:
 //
 // It is recommended to use ConnectToNSQLookupd so that topics are discovered
 // automatically.  This method is useful when you want to connect to local instance.
-func (r *Consumer) ConnectToNSQDs(addresses []string) error {
+func (r *Consumer) ConnectToNSQDs(addresses []AddrPartInfo) error {
 	for _, addr := range addresses {
-		err := r.ConnectToNSQD(addr)
+		err := r.ConnectToNSQD(addr.addr, addr.pid)
 		if err != nil {
 			return err
 		}
@@ -512,7 +669,7 @@ func (r *Consumer) ConnectToNSQDs(addresses []string) error {
 // It is recommended to use ConnectToNSQLookupd so that topics are discovered
 // automatically.  This method is useful when you want to connect to a single, local,
 // instance.
-func (r *Consumer) ConnectToNSQD(addr string) error {
+func (r *Consumer) ConnectToNSQD(addr string, part int) error {
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
 		return errors.New("consumer stopped")
 	}
@@ -521,33 +678,45 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		return errors.New("no handlers")
 	}
 
+	if r.partition != -1 && r.partition != part {
+		return errors.New("nsqd partition not matched with consumer partition")
+	}
+
 	atomic.StoreInt32(&r.connectedFlag, 1)
 
 	logger, logLvl := r.getLogger()
 
 	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
+	conn.consumePart = strconv.Itoa(part)
+	conn.ext = r.IsConsumeExt()
 	conn.SetLogger(logger, logLvl,
-		fmt.Sprintf("%3d [%s/%s] (%%s)", r.id, r.topic, r.channel))
+		fmt.Sprintf("%3d [%s(%v)/%s] (%%s)", r.id, r.topic, part, r.channel))
 
 	r.mtx.Lock()
-	_, pendingOk := r.pendingConnections[addr]
-	_, ok := r.connections[addr]
+	// here we assume only partition for each topic on node
+	// if more than one partitions, in order to consume all partitions,
+	// we need more connections to the same node
+	cid := conn.GetConnUID()
+	_, pendingOk := r.pendingConnections[cid]
+	_, ok := r.connections[cid]
 	if ok || pendingOk {
 		r.mtx.Unlock()
 		return ErrAlreadyConnected
 	}
-	r.pendingConnections[addr] = conn
-	if idx := indexOf(addr, r.nsqdTCPAddrs); idx == -1 {
-		r.nsqdTCPAddrs = append(r.nsqdTCPAddrs, addr)
+	r.pendingConnections[cid] = conn
+	if idx := indexOfAddrPartInfo(addr, conn.consumePart, r.nsqdTCPAddrs); idx == -1 {
+		r.nsqdTCPAddrs = append(r.nsqdTCPAddrs, AddrPartInfo{addr, part})
 	}
 	r.mtx.Unlock()
 
-	r.log(LogLevelInfo, "(%s) connecting to nsqd", addr)
+	r.log(LogLevelInfo, "consumer init new connection to nsqd: (%s) for topic %v-%v, channel: %v",
+		addr, r.topic, part, r.channel)
 
 	cleanupConnection := func() {
 		r.mtx.Lock()
-		delete(r.pendingConnections, addr)
+		delete(r.pendingConnections, cid)
 		r.mtx.Unlock()
+		r.log(LogLevelInfo, "consumer cleanup connection: (%s) ", cid)
 		conn.Close()
 	}
 
@@ -565,17 +734,50 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		}
 	}
 
-	cmd := Subscribe(r.topic, r.channel)
+	var cmd *Command
+	var offset ConsumeOffset
+	var hasConsumeOffset bool
+	r.offsetMutex.Lock()
+	if offset, hasConsumeOffset = r.consumeOffset[part]; hasConsumeOffset {
+		r.log(LogLevelInfo, "topic %v partition %v consume offset at offset: %v", r.topic, part, offset)
+	}
+	r.offsetMutex.Unlock()
+
+	if part == -1 || part == OLD_VERSION_PID {
+		if hasConsumeOffset || r.config.EnableOrdered {
+			r.log(LogLevelError, "partition must be given for ordered consumer ")
+			return errors.New("missing partition for ordered consumer")
+		}
+		// consume from old nsqd with no partition
+		if r.config.EnableTrace {
+			cmd = SubscribeAndTrace(r.topic, r.channel)
+		} else {
+			cmd = Subscribe(r.topic, r.channel)
+		}
+	} else {
+		if hasConsumeOffset {
+			cmd = SubscribeAdvanced(r.topic, r.channel, strconv.Itoa(part), offset)
+		} else if r.config.EnableOrdered {
+			cmd = SubscribeOrdered(r.topic, r.channel, strconv.Itoa(part))
+		} else if r.config.EnableTrace {
+			cmd = SubscribeWithPartAndTrace(r.topic, r.channel, strconv.Itoa(part))
+		} else {
+			cmd = SubscribeWithPart(r.topic, r.channel, strconv.Itoa(part))
+		}
+	}
 	err = conn.WriteCommand(cmd)
 	if err != nil {
 		cleanupConnection()
-		return fmt.Errorf("[%s] failed to subscribe to %s:%s - %s",
-			conn, r.topic, r.channel, err.Error())
+		return fmt.Errorf("%v [%s] failed to subscribe to %s(%v):%s - %s",
+			addr, conn, r.topic, part, r.channel, err.Error())
+	}
+	if hasConsumeOffset {
+		delete(r.consumeOffset, part)
 	}
 
 	r.mtx.Lock()
-	delete(r.pendingConnections, addr)
-	r.connections[addr] = conn
+	delete(r.pendingConnections, cid)
+	r.connections[cid] = conn
 	r.mtx.Unlock()
 
 	// pre-emptive signal to existing connections to lower their RDY count
@@ -584,6 +786,15 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	}
 
 	return nil
+}
+
+func indexOfAddrPartInfo(n string, pid string, h []AddrPartInfo) int {
+	for i, a := range h {
+		if n == a.addr && pid == strconv.Itoa(a.pid) {
+			return i
+		}
+	}
+	return -1
 }
 
 func indexOf(n string, h []string) int {
@@ -597,11 +808,11 @@ func indexOf(n string, h []string) int {
 
 // DisconnectFromNSQD closes the connection to and removes the specified
 // `nsqd` address from the list
-func (r *Consumer) DisconnectFromNSQD(addr string) error {
+func (r *Consumer) DisconnectFromNSQD(addr string, part string) error {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 
-	idx := indexOf(addr, r.nsqdTCPAddrs)
+	idx := indexOfAddrPartInfo(addr, part, r.nsqdTCPAddrs)
 	if idx == -1 {
 		return ErrNotConnected
 	}
@@ -644,6 +855,15 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
 	atomic.AddInt64(&r.totalRdyCount, -1)
 	atomic.AddUint64(&r.messagesReceived, 1)
+	if r.config.EnableOrdered || r.config.EnableTrace {
+		if len(msg.Body) < 12 {
+			r.log(LogLevelError, "invalid message body length: %v, %v", len(msg.Body), msg)
+		}
+		// get the offset and rawSize from body
+		msg.Offset = uint64(binary.BigEndian.Uint64(msg.Body[:8]))
+		msg.RawSize = uint32(binary.BigEndian.Uint32(msg.Body[8 : 8+4]))
+		msg.Body = msg.Body[8+4:]
+	}
 	r.incomingMessages <- msg
 	r.maybeUpdateRDY(c)
 }
@@ -679,7 +899,22 @@ func (r *Consumer) onConnResponse(c *Conn, data []byte) {
 	}
 }
 
-func (r *Consumer) onConnError(c *Conn, data []byte) {}
+func (r *Consumer) onConnError(c *Conn, data []byte) {
+	r.log(LogLevelInfo, "conn %v error response : %v", c.RemoteAddr(), string(data))
+	if IsFailedOnNotLeaderBytes(data) || IsTopicNotExistBytes(data) || IsFailedOnNotWritableBytes(data) {
+		addr := c.RemoteAddr()
+		r.log(LogLevelInfo, "removing nsqd address %v for error: %v", addr, string(data))
+		r.DisconnectFromNSQD(addr.String(), c.consumePart)
+		go func() {
+			time.Sleep(time.Second)
+			select {
+			case r.lookupdRecheckChan <- 1:
+			default:
+			}
+		}()
+		r.log(LogLevelInfo, "removed for error response")
+	}
+}
 
 func (r *Consumer) onConnHeartbeat(c *Conn) {}
 
@@ -695,16 +930,16 @@ func (r *Consumer) onConnClose(c *Conn) {
 	atomic.AddInt64(&r.totalRdyCount, -rdyCount)
 
 	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
+	if timer, ok := r.rdyRetryTimers[c.GetConnUID()]; ok {
 		// stop any pending retry of an old RDY update
 		timer.Stop()
-		delete(r.rdyRetryTimers, c.String())
+		delete(r.rdyRetryTimers, c.GetConnUID())
 		hasRDYRetryTimer = true
 	}
 	r.rdyRetryMtx.Unlock()
 
 	r.mtx.Lock()
-	delete(r.connections, c.String())
+	delete(r.connections, c.GetConnUID())
 	left := len(r.connections)
 	r.mtx.Unlock()
 
@@ -730,18 +965,21 @@ func (r *Consumer) onConnClose(c *Conn) {
 
 	r.mtx.RLock()
 	numLookupd := len(r.lookupdHTTPAddrs)
-	reconnect := indexOf(c.String(), r.nsqdTCPAddrs) >= 0
+	reconnect := indexOfAddrPartInfo(c.String(), c.consumePart, r.nsqdTCPAddrs) >= 0
 	r.mtx.RUnlock()
 	if numLookupd > 0 {
 		// trigger a poll of the lookupd
-		select {
-		case r.lookupdRecheckChan <- 1:
-		default:
-		}
+		go func() {
+			time.Sleep(time.Second)
+			select {
+			case r.lookupdRecheckChan <- 1:
+			default:
+			}
+		}()
 	} else if reconnect {
 		// there are no lookupd and we still have this nsqd TCP address in our list...
 		// try to reconnect after a bit
-		go func(addr string) {
+		go func(addr string, pid string) {
 			for {
 				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
 				time.Sleep(r.config.LookupdPollInterval)
@@ -749,20 +987,25 @@ func (r *Consumer) onConnClose(c *Conn) {
 					break
 				}
 				r.mtx.RLock()
-				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
+				index := indexOfAddrPartInfo(addr, pid, r.nsqdTCPAddrs)
+				reconnect := index >= 0
+				var addrInfo AddrPartInfo
+				if index != -1 {
+					addrInfo = r.nsqdTCPAddrs[index]
+				}
 				r.mtx.RUnlock()
 				if !reconnect {
 					r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
 					return
 				}
-				err := r.ConnectToNSQD(addr)
+				err := r.ConnectToNSQD(addrInfo.addr, addrInfo.pid)
 				if err != nil && err != ErrAlreadyConnected {
 					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
 					continue
 				}
 				break
 			}
-		}(c.String())
+		}(c.String(), c.consumePart)
 	}
 }
 
@@ -798,7 +1041,7 @@ func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
 	if r.backoffCounter == 0 && backoffUpdated {
 		// exit backoff
 		count := r.perConnMaxInFlight()
-		r.log(LogLevelWarning, "exiting backoff, returning all to RDY %d", count)
+		r.log(LogLevelDebug, "exiting backoff, returning all to RDY %d", count)
 		for _, c := range r.conns() {
 			r.updateRDY(c, count)
 		}
@@ -810,8 +1053,8 @@ func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
 			backoffDuration = r.config.MaxBackoffDuration
 		}
 
-		r.log(LogLevelWarning, "backing off for %s (backoff level %d), setting all to RDY 0",
-			backoffDuration, backoffCounter)
+		r.log(LogLevelInfo, "backing off for %.04f seconds (backoff level %d), setting all to RDY 0",
+			backoffDuration.Seconds(), backoffCounter)
 
 		// send RDY 0 immediately (to *all* connections)
 		for _, c := range r.conns() {
@@ -837,7 +1080,7 @@ func (r *Consumer) resume() {
 	conns := r.conns()
 	if len(conns) == 0 {
 		r.log(LogLevelWarning, "no connection available to resume")
-		r.log(LogLevelWarning, "backing off for %s", time.Second)
+		r.log(LogLevelWarning, "backing off for %.04f seconds", 1)
 		r.backoff(time.Second)
 		return
 	}
@@ -846,7 +1089,7 @@ func (r *Consumer) resume() {
 	r.rngMtx.Unlock()
 	choice := conns[idx]
 
-	r.log(LogLevelWarning,
+	r.log(LogLevelDebug,
 		"(%s) backoff timeout expired, sending RDY 1",
 		choice.String())
 
@@ -854,7 +1097,7 @@ func (r *Consumer) resume() {
 	err := r.updateRDY(choice, 1)
 	if err != nil {
 		r.log(LogLevelWarning, "(%s) error resuming RDY 1 - %s", choice.String(), err)
-		r.log(LogLevelWarning, "backing off for %s", time.Second)
+		r.log(LogLevelWarning, "backing off for %.04f seconds", 1)
 		r.backoff(time.Second)
 		return
 	}
@@ -924,9 +1167,9 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 
 	// stop any pending retry of an old RDY update
 	r.rdyRetryMtx.Lock()
-	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
+	if timer, ok := r.rdyRetryTimers[c.GetConnUID()]; ok {
 		timer.Stop()
-		delete(r.rdyRetryTimers, c.String())
+		delete(r.rdyRetryTimers, c.GetConnUID())
 	}
 	r.rdyRetryMtx.Unlock()
 
@@ -943,7 +1186,7 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 			// in order to prevent eternal starvation we reschedule this attempt
 			// (if any other RDY update succeeds this timer will be stopped)
 			r.rdyRetryMtx.Lock()
-			r.rdyRetryTimers[c.String()] = time.AfterFunc(5*time.Second,
+			r.rdyRetryTimers[c.GetConnUID()] = time.AfterFunc(5*time.Second,
 				func() {
 					r.updateRDY(c, count)
 				})
@@ -1002,18 +1245,12 @@ func (r *Consumer) redistributeRDY() {
 	possibleConns := make([]*Conn, 0, len(conns))
 	for _, c := range conns {
 		lastMsgDuration := time.Now().Sub(c.LastMessageTime())
-		lastRdyDuration := time.Now().Sub(c.LastRdyTime())
 		rdyCount := c.RDY()
 		r.log(LogLevelDebug, "(%s) rdy: %d (last message received %s)",
 			c.String(), rdyCount, lastMsgDuration)
-		if rdyCount > 0 {
-			if lastMsgDuration > r.config.LowRdyIdleTimeout {
-				r.log(LogLevelDebug, "(%s) idle connection, giving up RDY", c.String())
-				r.updateRDY(c, 0)
-			} else if lastRdyDuration > r.config.LowRdyTimeout {
-				r.log(LogLevelDebug, "(%s) RDY timeout, giving up RDY", c.String())
-				r.updateRDY(c, 0)
-			}
+		if rdyCount > 0 && lastMsgDuration > r.config.LowRdyIdleTimeout {
+			r.log(LogLevelDebug, "(%s) idle connection, giving up RDY", c.String())
+			r.updateRDY(c, 0)
 		}
 		possibleConns = append(possibleConns, c)
 	}
@@ -1102,7 +1339,27 @@ func (r *Consumer) AddConcurrentHandlers(handler Handler, concurrency int) {
 	}
 }
 
+func (r *Consumer) AddConcurrentHandlerFuncs(handler HandlerFunc, failHandler FailHandlerFunc, concurrency int) {
+	if atomic.LoadInt32(&r.connectedFlag) == 1 {
+		panic("already connected")
+	}
+
+	atomic.AddInt32(&r.runningHandlers, int32(concurrency))
+	for i := 0; i < concurrency; i++ {
+		go r.handlerFuncLoop(handler, failHandler)
+	}
+}
+
 func (r *Consumer) handlerLoop(handler Handler) {
+	failedHandler, ok := handler.(FailedMessageLogger)
+	var f FailHandlerFunc
+	if ok {
+		f = failedHandler.LogFailedMessage
+	}
+	r.handlerFuncLoop(handler.HandleMessage, f)
+}
+
+func (r *Consumer) handlerFuncLoop(handlerFunc HandlerFunc, failedFunc FailHandlerFunc) {
 	r.log(LogLevelDebug, "starting Handler")
 
 	for {
@@ -1111,12 +1368,12 @@ func (r *Consumer) handlerLoop(handler Handler) {
 			goto exit
 		}
 
-		if r.shouldFailMessage(message, handler) {
+		if r.shouldFailMessage(message, failedFunc) {
 			message.Finish()
 			continue
 		}
 
-		err := handler.HandleMessage(message)
+		err := handlerFunc(message)
 		if err != nil {
 			r.log(LogLevelError, "Handler returned error (%s) for msg %s", err, message.ID)
 			if !message.IsAutoResponseDisabled() {
@@ -1137,15 +1394,14 @@ exit:
 	}
 }
 
-func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool {
+func (r *Consumer) shouldFailMessage(message *Message, handlerFunc FailHandlerFunc) bool {
 	// message passed the max number of attempts
 	if r.config.MaxAttempts > 0 && message.Attempts > r.config.MaxAttempts {
 		r.log(LogLevelWarning, "msg %s attempted %d times, giving up",
 			message.ID, message.Attempts)
 
-		logger, ok := handler.(FailedMessageLogger)
-		if ok {
-			logger.LogFailedMessage(message)
+		if handlerFunc != nil {
+			handlerFunc(message)
 		}
 
 		return true
@@ -1172,7 +1428,7 @@ func (r *Consumer) log(lvl LogLevel, line string, args ...interface{}) {
 		return
 	}
 
-	logger.Output(2, fmt.Sprintf("%-4s %3d [%s/%s] %s",
-		lvl, r.id, r.topic, r.channel,
+	logger.Output(2, fmt.Sprintf("%-4s %3d [%s(%v)/%s] %s",
+		lvl, r.id, r.topic, r.partition, r.channel,
 		fmt.Sprintf(line, args...)))
 }
