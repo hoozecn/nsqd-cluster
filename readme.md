@@ -1,4 +1,4 @@
-## testing
+## 有赞NSQ集群评估 （需要安装 docker和docker-compose）
 
 1. start nsq cluster
 
