@@ -31,5 +31,8 @@ func main() {
 
 	// produce message via nsqd_2
 	go produce("nsqd-cluster_nsqd_2:4150")
+
+	// produce message via nsqd_2
+	go produce("nsqd-cluster_nsqd_3:4150")
 	select {}
 }
